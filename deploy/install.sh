@@ -23,9 +23,15 @@ fi
 
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 
+NGINX_WAS_ACTIVE="false"
+if systemctl is-active --quiet nginx; then
+  NGINX_WAS_ACTIVE="true"
+fi
+
 if ! command -v nginx >/dev/null 2>&1; then
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+  DEBIAN_FRONTEND=noninteractive apt-get install -y nginx-light
+  systemctl disable nginx >/dev/null 2>&1 || true
 fi
 
 command -v nginx >/dev/null 2>&1 || fail "nginx installation failed."
@@ -45,12 +51,28 @@ if [[ ! -d "$NGINX_AVAILABLE" || ! -d /etc/nginx/sites-enabled ]]; then
   fail "Expected nginx sites-available and sites-enabled directories. Install Debian's nginx package."
 fi
 
+if [[ -e /etc/nginx/sites-enabled/default && ! -L /etc/nginx/sites-enabled/default ]]; then
+  mv /etc/nginx/sites-enabled/default "/etc/nginx/sites-enabled/default.disabled-by-goodgames"
+elif [[ -L /etc/nginx/sites-enabled/default ]]; then
+  rm /etc/nginx/sites-enabled/default
+fi
+
 if command -v ss >/dev/null 2>&1; then
   for port in 18081 8443; do
     if ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN; then
       fail "Port ${port} is already in use. Identify its owner with 'ss -ltnp | grep :${port}' and free the port before deployment."
     fi
   done
+fi
+
+if [[ -e /etc/nginx/sites-enabled/default && ! -L /etc/nginx/sites-enabled/default ]]; then
+  mv /etc/nginx/sites-enabled/default "/etc/nginx/sites-enabled/default.disabled-by-goodgames"
+elif [[ -L /etc/nginx/sites-enabled/default ]]; then
+  rm /etc/nginx/sites-enabled/default
+fi
+
+if ! systemctl is-active --quiet nginx && command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep -Eq '[:.]443[[:space:]]'; then
+  fail "Port 443 is already in use, but nginx is not running. Identify its owner with 'ss -ltnp | grep :443', then stop or reconfigure that service before deployment."
 fi
 
 if [[ -e "$NGINX_ENABLED" && ! -L "$NGINX_ENABLED" ]]; then
@@ -113,10 +135,15 @@ else
   write_http_config
 fi
 nginx -t
-if systemctl is-active --quiet nginx; then
+if [[ "$NGINX_WAS_ACTIVE" == "true" ]]; then
   systemctl reload nginx
 else
-  systemctl enable --now nginx || fail "Could not start nginx. Check 'systemctl status nginx' and 'journalctl -xeu nginx'."
+  if pgrep -x nginx >/dev/null 2>&1; then
+    nginx -s reload || fail "Could not reload nginx. Check 'nginx -t' and nginx logs."
+  else
+    nginx || fail "Could not start nginx. Check 'nginx -t' and 'ss -ltnp'."
+  fi
+  systemctl disable nginx >/dev/null 2>&1 || true
 fi
 
 certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
@@ -125,12 +152,25 @@ certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
 
 sed "s/__DOMAIN__/${DOMAIN}/g" "${APP_DIR}/deploy/nginx-host.conf.template" > "$NGINX_SITE"
 nginx -t
-systemctl reload nginx
+if systemctl is-active --quiet nginx; then
+  systemctl reload nginx
+elif pgrep -x nginx >/dev/null 2>&1; then
+  nginx -s reload
+else
+  nginx || fail "Could not start nginx after certificate issue."
+  systemctl disable nginx >/dev/null 2>&1 || true
+fi
 
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/reload-goodgames-nginx.sh <<'EOF'
 #!/usr/bin/env sh
-systemctl reload nginx
+if systemctl is-active --quiet nginx; then
+  systemctl reload nginx
+elif pgrep -x nginx >/dev/null 2>&1; then
+  nginx -s reload
+else
+  nginx
+fi
 EOF
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-goodgames-nginx.sh
 systemctl enable --now certbot.timer
